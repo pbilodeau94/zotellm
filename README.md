@@ -1,27 +1,28 @@
 # zotero-field-insert
 
-Insert Zotero-compatible field codes into Word (.docx) documents programmatically.
+Insert Zotero-compatible field codes into Word (.docx) documents programmatically, with optional LLM-powered citation formatting.
 
 ## Problem
 
-When you generate Word documents from Markdown (via pandoc), LaTeX, or Python, there is no way to include live Zotero citations. Pandoc's `--citeproc` produces plain text references that the Zotero Word plugin cannot recognize or manage. This tool bridges that gap.
+When you generate Word documents from Markdown (via pandoc), LaTeX, or Python, there is no way to include live Zotero citations. Pandoc's `--citeproc` produces plain text references that the Zotero Word plugin cannot recognize or manage. This toolkit bridges that gap.
 
-## What it does
+## Tools
 
-1. Finds `[@citationkey]` markers in a `.docx` file
-2. Replaces each with a proper `ADDIN ZOTERO_ITEM CSL_CITATION` Word field code containing full CSL-JSON metadata
-3. Inserts an `ADDIN ZOTERO_BIBL` field where the bibliography should appear
-4. Optionally links citations back to your local Zotero library using item keys and your Zotero SQLite database
+### 1. `zotero_field_insert.py` — Insert Zotero field codes
 
-After running the script, open the document in Word and click **Refresh** in the Zotero tab. Zotero will renumber citations, apply your chosen citation style, and generate the bibliography.
+Finds `[@citationkey]` markers in a `.docx` file and replaces each with proper `ADDIN ZOTERO_ITEM CSL_CITATION` Word field codes. Also inserts an `ADDIN ZOTERO_BIBL` field for the bibliography.
+
+### 2. `llm_reference_formatter.py` — LLM-powered citation formatting
+
+Uses Claude to identify informal citations in a markdown document (e.g., "Banwell et al., 2023"), looks up full metadata via CrossRef, optionally adds items to your Zotero library, and outputs pandoc-ready markdown with `[@citekey]` markers plus a CSL JSON bibliography.
 
 ## Installation
 
 ```bash
-pip install python-docx
+pip install python-docx anthropic requests
 ```
 
-No other dependencies. The script reads the Zotero SQLite database directly (read-only) if you want to link citations to your library.
+The `anthropic` and `requests` packages are only needed for `llm_reference_formatter.py`. Set the `ANTHROPIC_API_KEY` environment variable to use the LLM formatter.
 
 ## Usage
 
@@ -92,7 +93,83 @@ Maps citation keys to Zotero item keys so the plugin can link back to your libra
 
 Set a key to `null` if the item is not in your Zotero library. The script will generate a placeholder URI.
 
-## Workflow with pandoc
+## LLM Reference Formatter
+
+### What it does
+
+1. Reads a markdown document with informal citations (e.g., "Banwell et al., 2023", "(Smith 2020)")
+2. Uses Claude to identify every citation and extract author/year/title metadata
+3. Searches CrossRef for full bibliographic metadata (DOI, journal, volume, pages)
+4. Optionally looks up items in your local Zotero database or adds new ones via the Zotero Web API
+5. Rewrites the document with `[@citekey]` pandoc citation markers
+6. Outputs `references.json` (CSL JSON) and `keymap.json` for `zotero_field_insert.py`
+
+### Usage
+
+```bash
+# Basic: identify citations and format
+python llm_reference_formatter.py paper.md -o paper_cited.md
+
+# With Zotero library lookups (local DB)
+python llm_reference_formatter.py paper.md -o paper_cited.md \
+    --zotero-db ~/Zotero/zotero.sqlite
+
+# With Zotero Web API (add missing items to your library)
+python llm_reference_formatter.py paper.md -o paper_cited.md \
+    --zotero-db ~/Zotero/zotero.sqlite \
+    --zotero-api-key YOUR_API_KEY \
+    --zotero-library-id 1793208
+
+# Dry run (show what would be done)
+python llm_reference_formatter.py paper.md --dry-run
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|---|---|---|
+| `input` | Yes | Input markdown file with informal citations |
+| `--output`, `-o` | No | Output markdown path (default: `input_cited.md`) |
+| `--bib-output` | No | CSL JSON output path (default: `references.json`) |
+| `--keymap-output` | No | Keymap output path (default: `keymap.json`) |
+| `--zotero-api-key` | No | Zotero Web API key (for adding items to library) |
+| `--zotero-library-id` | No | Zotero user library ID |
+| `--zotero-db` | No | Path to local `zotero.sqlite` (for key lookups) |
+| `--model` | No | Claude model (default: claude-sonnet-4-20250514) |
+| `--no-crossref` | No | Skip CrossRef lookups |
+| `--dry-run` | No | Preview without writing files |
+
+### Getting a Zotero API key
+
+1. Go to https://www.zotero.org/settings/keys
+2. Create a new key with read/write access to your library
+3. Your library ID is visible in the URL when viewing your library on zotero.org
+
+## Full Pipeline
+
+The two tools work together for a complete workflow:
+
+```bash
+# 1. Write your document with informal citations
+#    "MOGAD is diagnosed using criteria (Banwell et al., 2023)"
+
+# 2. Format citations with the LLM tool
+python llm_reference_formatter.py paper.md -o paper_cited.md \
+    --zotero-db ~/Zotero/zotero.sqlite
+
+# 3. Convert to docx with pandoc (no --citeproc)
+pandoc paper_cited.md -o paper.docx --reference-doc=template.docx
+
+# 4. Insert Zotero field codes
+python zotero_field_insert.py paper.docx \
+    --bib references.json \
+    --keymap keymap.json \
+    --zotero-db ~/Zotero/zotero.sqlite
+
+# 5. Open paper.docx in Word, click Zotero > Refresh
+```
+
+## Workflow with pandoc (manual)
 
 A typical workflow for generating a Word document from Markdown with live Zotero citations:
 
