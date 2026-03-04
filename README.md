@@ -24,11 +24,25 @@ pip install python-docx requests
 
 No other dependencies required. The LLM formatter uses raw HTTP requests for API calls, or can shell out to any CLI tool (claude, ollama, llm).
 
+## Citation Format
+
+Write citations in your markdown however is natural. The tool uses an LLM to extract metadata and CrossRef/PubMed to resolve full bibliographic records. Including more detail improves matching accuracy:
+
+| Format | Match rate | Example |
+|---|---|---|
+| Author, Journal, Year | ~95% | `(Cryan et al., Nature Reviews Neuroscience, 2019)` |
+| Author, Year | ~75% | `(Cryan et al., 2019)` |
+| Author only | ~50% | `(Cryan et al.)` |
+
+**Recommended**: Include at least the **author, year, and journal**. The journal name disambiguates common author/year combinations. The LLM also uses surrounding context to infer what the cited paper is about, which helps when citations are sparse.
+
+Any format works — parenthetical, narrative, numbered references, or even bare mentions like "as Cryan and colleagues showed." The LLM identifies them all.
+
 ## Full Pipeline
 
 ```bash
 # 1. Write your document with informal citations
-#    "MOGAD is diagnosed using criteria (Banwell et al., 2023)"
+#    "MOGAD is diagnosed using criteria (Banwell et al., Lancet Neurology, 2023)"
 
 # 2. Format citations with the LLM tool
 python llm_reference_formatter.py paper.md -o paper_cited.md \
