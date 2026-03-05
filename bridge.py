@@ -1,15 +1,15 @@
 """
 bridge.py
 
-NDJSON bridge between Electron frontend and zotellm backend.
+NDJSON bridge between the desktop frontend and zotellm backend.
 Reads commands from stdin, writes events to stdout as JSON lines.
 
 Protocol:
-  Electron -> Python (stdin):
+  Frontend -> Python (stdin):
     {"type": "start", "args": {"input": "/path/file.docx", ...}}
     {"type": "resolve_response", "id": "req_1", "choice": "skip" | {"DOI":"..."} | 0}
 
-  Python -> Electron (stdout):
+  Python -> Frontend (stdout):
     {"type": "log", "text": "..."}
     {"type": "resolve", "id": "req_1", "citation_text": "...", "candidates": [...]}
     {"type": "done", "success": true, "message": "..."}
@@ -59,7 +59,7 @@ def _read_line():
 def _resolve_callback(citation_text, candidates):
     """Called by run_zotellm when a citation match is uncertain.
 
-    Sends a resolve request to Electron, blocks until the user responds.
+    Sends a resolve request to the frontend, blocks until the user responds.
     """
     req_id = f"req_{id(candidates)}"
 
@@ -75,7 +75,7 @@ def _resolve_callback(citation_text, candidates):
         "candidates": serialized,
     })
 
-    # Block until Electron sends back a resolve_response
+    # Block until the frontend sends back a resolve_response
     while True:
         msg = _read_line()
         if msg.get("type") == "resolve_response" and msg.get("id") == req_id:

@@ -7,7 +7,7 @@ let mainWindow;
 let backendProcess = null;
 let shellPATH = null;
 
-// On macOS, Electron apps launched from Finder get a minimal PATH.
+// On macOS, apps launched from Finder get a minimal PATH.
 // Resolve the user's full shell PATH so the backend can find claude, pandoc, etc.
 function getShellPATH() {
   if (shellPATH !== null) return shellPATH;
