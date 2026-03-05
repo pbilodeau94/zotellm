@@ -1,0 +1,35 @@
+{
+  "name": "zotellm",
+  "version": "1.0.0",
+  "description": "zotellm – citation formatting with Zotero field codes",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.zotellm.app",
+    "productName": "zotellm",
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dmg",
+      "icon": null
+    },
+    "extraResources": [
+      {
+        "from": "../dist/zotellm_backend",
+        "to": "backend",
+        "filter": ["**/*"]
+      }
+    ],
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*"
+    ]
+  }
+}

@@ -62,10 +62,21 @@ and identify every citation or reference to a published work.
 For each citation found, extract:
 1. The text as it appears in the document (e.g., "Banwell et al., 2023" or "(Smith 2020)")
 2. First author last name, year
-3. **CRITICAL: Infer the likely title or topic of the cited work from the surrounding \
-context.** For example, if the text says "The RAND/UCLA Appropriateness Method recommends \
-a panel of 9 members (Fitch et al. 2001)", the title_hint should be "RAND UCLA \
-appropriateness method manual". Be specific — this is the primary field used for search.
+3. **CRITICAL -- title_hint: Infer what this paper is about from the surrounding \
+sentence. This is the PRIMARY field used to search PubMed, so it must contain \
+specific keywords that would appear in the paper's actual title.** \
+Rules for a good title_hint: \
+- Include the specific DISEASE or CONDITION (e.g., "MOGAD", "giant-cell arteritis", "rheumatoid arthritis") \
+- Include any DRUG, TREATMENT, or INTERVENTION (e.g., "tocilizumab", "rituximab", "IVIG") \
+- Include the STUDY TYPE if apparent (e.g., "trial", "meta-analysis", "cohort", "case series") \
+- Include any BIOMARKER or MEASUREMENT (e.g., "CSF cytokine", "interleukin-6", "neurofilament") \
+- Be as specific as possible: "tocilizumab giant-cell arteritis trial" is MUCH better than "tocilizumab trial" \
+- Use 4-8 keywords that would distinguish this paper from other papers by the same author \
+Examples: \
+  - "Fitch et al. 2001" in context about appropriateness method -> "RAND UCLA appropriateness method manual" \
+  - "Stone et al. 2017" in context about tocilizumab for GCA -> "tocilizumab giant-cell arteritis randomized trial" \
+  - "Kaneko et al. 2018" in context about CSF cytokines in MOG -> "CSF cytokine profile MOG-IgG NMOSD" \
+  - "Chen et al. 2020" in context about steroid-sparing therapy for MOG -> "steroid-sparing maintenance immunotherapy MOG-IgG"
 4. Any journal name mentioned or inferable from context
 5. Any DOI or PMID if mentioned (e.g., "PMID: 12345678" or "doi: 10.1000/xyz")
 6. A suggested citation key in the format: firstauthorlastnameYEAR (lowercase, no spaces)
@@ -207,19 +218,38 @@ def _call_anthropic(prompt, model, api_key=None, max_tokens=8192):
     return resp.json()["content"][0]["text"].strip()
 
 
+def _find_claude_cli():
+    """Find claude CLI, checking common install locations as fallback."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    # Common macOS install locations not in bundled app PATH
+    for p in [
+        os.path.expanduser("~/.local/bin/claude"),
+        os.path.expanduser("~/.npm-global/bin/claude"),
+        "/usr/local/bin/claude",
+        os.path.expanduser("~/.claude/bin/claude"),
+    ]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _call_cli(prompt, cli_command=None):
     if cli_command:
         cmd = cli_command
-    elif shutil.which("claude"):
-        cmd = "claude --print"
-    elif shutil.which("ollama"):
-        cmd = "ollama run llama3"
-    elif shutil.which("llm"):
-        cmd = "llm"
     else:
-        print("Error: no LLM CLI tool found. Install claude, ollama, or llm,")
-        print("  or specify --cli-command 'your-command'")
-        sys.exit(1)
+        claude_path = _find_claude_cli()
+        if claude_path:
+            cmd = f'"{claude_path}" --print'
+        elif shutil.which("ollama"):
+            cmd = "ollama run llama3"
+        elif shutil.which("llm"):
+            cmd = "llm"
+        else:
+            print("Error: no LLM CLI tool found. Install claude, ollama, or llm,")
+            print("  or specify --cli-command 'your-command'")
+            sys.exit(1)
     print(f"  Using CLI: {cmd}")
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -232,15 +262,138 @@ def _call_cli(prompt, cli_command=None):
 
 
 # ---------------------------------------------------------------------------
+# Journal abbreviation handling
+# ---------------------------------------------------------------------------
+
+# Session-level cache: maps a raw journal string -> its full title from NLM.
+_nlm_journal_cache = {}
+
+
+def _strip_journal(name):
+    """Lowercase, strip punctuation/hyphens/whitespace to a canonical token list."""
+    if not name:
+        return []
+    # Decode HTML entities (CrossRef uses &amp; etc.)
+    import html
+    s = html.unescape(name).lower()
+    # Replace hyphens, periods, colons, commas, ampersands with spaces
+    s = re.sub(r"[.\-:,;&/()]+", " ", s)
+    stop = {"the", "of", "and", "in", "for", "on", "to", "a", "an"}
+    return [w for w in s.split() if w and w not in stop]
+
+
+def lookup_nlm_journal(name):
+    """Query the NLM Catalog API to resolve a journal name.
+
+    Returns a dict with 'full' (full title) and 'abbrev' (MedLine TA) keys,
+    or None if not found.  Results are cached for the session.
+    """
+    if not name or not name.strip():
+        return None
+
+    key = " ".join(_strip_journal(name))
+    if key in _nlm_journal_cache:
+        return _nlm_journal_cache[key]
+
+    result = None
+    ncbi_base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+    try:
+        ids = []
+        # Try title-abbreviation [ta], then [JournalName] as fallback
+        for field in ("ta", "JournalName"):
+            time.sleep(0.4)
+            resp = requests.get(
+                f"{ncbi_base}/esearch.fcgi",
+                params={"db": "nlmcatalog", "term": f"{name}[{field}]",
+                        "retmax": 1, "retmode": "json"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            ids = resp.json().get("esearchresult", {}).get("idlist", [])
+            if ids:
+                break
+
+        if ids:
+            time.sleep(0.4)
+            resp = requests.get(
+                f"{ncbi_base}/esummary.fcgi",
+                params={"db": "nlmcatalog", "id": ids[0], "retmode": "json"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            rec = resp.json().get("result", {}).get(ids[0], {})
+            tmain = rec.get("titlemainlist", [])
+            full_title = ""
+            if tmain and isinstance(tmain, list):
+                full_title = tmain[0].get("title", "").rstrip(".")
+            else:
+                full_title = rec.get("title", "").rstrip(".")
+            medline_ta = rec.get("medlineta", "")
+            result = {"full": full_title, "abbrev": medline_ta or name}
+    except Exception:
+        pass
+
+    _nlm_journal_cache[key] = result
+    return result
+
+
+def _looks_abbreviated(name):
+    """Heuristic: does this journal name look like it uses abbreviations?
+
+    Returns True if the name contains periods after words, or if most words
+    look truncated (short without being common full words like 'Cell').
+    """
+    words = re.split(r"[\s.\-:,]+", name.strip())
+    words = [w for w in words if w and w.lower() not in
+             {"the", "of", "and", "in", "for", "on", "to", "a", "an", "&"}]
+    if not words:
+        return False
+    # Periods after words are a strong signal (e.g. "Ann." "Neurol.")
+    if re.search(r"[A-Za-z]\.", name):
+        return True
+    # Single-letter words (e.g. "J", "N") are abbreviations
+    if any(len(w) == 1 for w in words):
+        return True
+    # Known full single-word journals -- not abbreviated
+    single_word_journals = {"brain", "cell", "nature", "science", "neurology",
+                            "circulation", "gastroenterology", "bmj", "lancet",
+                            "blood", "chest", "gut", "spine", "stroke", "sleep",
+                            "pain", "cancer", "cortex", "epilepsia", "headache"}
+    if len(words) == 1 and words[0].lower() in single_word_journals:
+        return False
+    # If most words are short (< 7 chars), likely abbreviated
+    short_words = sum(1 for w in words if len(w) < 7)
+    return short_words / len(words) >= 0.5 and len(words) >= 2
+
+
+def normalize_journal(name, resolved_name=None):
+    """Produce a canonical, comparable form of a journal name.
+
+    Strip case, punctuation, hyphens, and stop words. If *resolved_name* is
+    provided (e.g. from an NLM lookup), use that instead of the raw name.
+    """
+    if not name and not resolved_name:
+        return ""
+    canonical = resolved_name if resolved_name else name
+    return " ".join(_strip_journal(canonical))
+
+
+# ---------------------------------------------------------------------------
 # CrossRef / PubMed
 # ---------------------------------------------------------------------------
 
-def search_crossref(query, author=None, year=None, rows=5):
-    params = {"query": query, "rows": rows, "mailto": CROSSREF_MAILTO}
+def search_crossref(query, author=None, year=None, journal=None, rows=5):
+    params = {"rows": rows, "mailto": CROSSREF_MAILTO}
+    # Use query.bibliographic for the main search text (matches title, author,
+    # year, etc.) rather than the generic "query" param which is less precise.
+    params["query.bibliographic"] = query
     if author:
         params["query.author"] = author
+    if journal:
+        params["query.container-title"] = journal
+    # Use filter for exact year match when available (more precise than text search)
     if year:
-        params["query.bibliographic"] = f"{query} {year}"
+        params["filter"] = f"from-pub-date:{int(year)-1},until-pub-date:{int(year)+1}"
     try:
         resp = requests.get(CROSSREF_API, params=params, timeout=15)
         resp.raise_for_status()
@@ -282,7 +435,37 @@ def crossref_to_csl(item):
     return csl
 
 
-def score_crossref_match(item, author=None, year=None, title_hint=None):
+def _extract_context_keywords(context, exclude=None):
+    """Pull topic-relevant keywords from the citation's surrounding sentence.
+
+    *exclude* is an optional set of lowercase words to ignore (e.g. author name
+    fragments, journal abbreviation tokens) so they don't pollute the query.
+    """
+    if not context:
+        return []
+    # Remove common academic boilerplate and short words
+    noise = {"et", "al", "the", "and", "was", "were", "are", "been", "have", "has",
+             "this", "that", "with", "from", "for", "not", "but", "also", "which",
+             "were", "been", "into", "than", "more", "most", "such", "our", "their",
+             "can", "may", "will", "would", "could", "should", "study", "studies",
+             "found", "showed", "shown", "reported", "described", "demonstrated",
+             "suggested", "associated", "included", "according", "effective",
+             "significantly", "compared", "respectively", "previously",
+             "patients", "cases", "results", "data", "using", "based", "recent",
+             "however", "although", "between", "among", "after", "before", "during"}
+    if exclude:
+        noise = noise | {w.lower() for w in exclude}
+    words = re.findall(r"[a-zA-Z]{4,}", context.lower())
+    return [w for w in words if w not in noise]
+
+
+def score_crossref_match(item, author=None, year=None, title_hint=None,
+                         journal_hint=None, journal_resolved=None, context=None):
+    """Score a CrossRef item against known citation metadata.
+
+    *journal_resolved* is the NLM-expanded full journal name (if available),
+    used to normalize the hint for comparison with the item's container-title.
+    """
     score = 0
     if author and item.get("author"):
         fa = item["author"][0].get("family", "").lower()
@@ -290,15 +473,39 @@ def score_crossref_match(item, author=None, year=None, title_hint=None):
             score += 3
         elif author.lower() in fa:
             score += 1
+        else:
+            # Check non-first authors (common for consortium/multi-author papers)
+            for a in item["author"][1:]:
+                if a.get("family", "").lower() == author.lower():
+                    score += 2
+                    break
     issued = item.get("issued", {}).get("date-parts", [[]])
     if issued and issued[0] and year:
         if str(issued[0][0]) == str(year):
             score += 3
+        elif abs(int(issued[0][0]) - int(year)) == 1:
+            score += 1  # epub vs print year mismatch
+    it = (item.get("title", [""])[0] if isinstance(item.get("title"), list)
+          else item.get("title", "")).lower()
     if title_hint:
-        it = (item.get("title", [""])[0] if isinstance(item.get("title"), list)
-              else item.get("title", "")).lower()
         hw = [w for w in title_hint.lower().split() if len(w) > 4]
         score += min(sum(1 for w in hw if w in it), 3)
+    # Use surrounding context to boost matches whose title overlaps the sentence
+    if context:
+        ctx_kw = _extract_context_keywords(context)
+        if ctx_kw:
+            hits = sum(1 for w in ctx_kw if w in it)
+            score += min(hits, 4)
+    if journal_hint:
+        ct = item.get("container-title", [])
+        ct_str = ct[0] if isinstance(ct, list) and ct else (ct if isinstance(ct, str) else "")
+        # Use NLM-resolved name for the hint; normalize container-title directly
+        norm_hint = normalize_journal(journal_hint, resolved_name=journal_resolved)
+        norm_ct = normalize_journal(ct_str)
+        if norm_hint and norm_ct and norm_hint == norm_ct:
+            score += 3
+        elif norm_hint and norm_ct and (norm_hint in norm_ct or norm_ct in norm_hint):
+            score += 2
     cr = item.get("score", 0)
     if cr > 100:
         score += 2
@@ -307,12 +514,16 @@ def score_crossref_match(item, author=None, year=None, title_hint=None):
     return score
 
 
-def search_pubmed(query, author=None, year=None, max_results=3):
+def search_pubmed(query, author=None, year=None, journal=None, max_results=3):
     terms = []
     if author:
         terms.append(f"{author}[Author]")
     if year:
-        terms.append(f"{year}[Date - Publication]")
+        # Allow +/- 1 year for epub vs print date discrepancies
+        y = int(year)
+        terms.append(f"({y - 1}:{y + 1}[Date - Publication])")
+    if journal:
+        terms.append(f"{journal}[Journal]")
     if query:
         terms.append(query)
     try:
@@ -362,39 +573,161 @@ def pmid_to_doi(pmid):
     return None
 
 
-def find_best_match(citation):
+def find_best_match(citation, top_n=1):
+    """Find best CrossRef/PubMed matches for a citation.
+
+    When top_n=1 (default), returns (best_item, best_score) for backward compat.
+    When top_n>1, returns list of (item, score) tuples sorted by score descending.
+    """
     author = citation.get("first_author", "")
     year = citation.get("year", "")
     title = citation.get("title_hint") or citation.get("title", "")
     journal = citation.get("journal_hint") or citation.get("journal", "")
-    queries = []
-    if title and len(title) > 10:
-        queries.append(title)
-    if author and title and len(title) > 5:
-        queries.append(f"{author} {title}")
-    if author and year:
-        queries.append(f"{author} {year}")
-    if author and journal:
-        queries.append(f"{author} {journal} {year}")
-    best_item, best_score = None, -1
-    for q in queries[:3]:
-        for item in search_crossref(q, author=author, year=year):
-            s = score_crossref_match(item, author, year, title)
-            if s > best_score:
-                best_score, best_item = s, item
-        if best_score >= 6:
-            break
-        time.sleep(0.5)
-    if best_score < 5 and (author or title):
-        pq = title if title and len(title) > 10 else f"{author} {year}"
-        for doi in search_pubmed(pq, author=author, year=year):
+    context = citation.get("context", "")
+
+    # Resolve abbreviated journal names via NLM
+    nlm_info = lookup_nlm_journal(journal) if journal else None
+    journal_full = nlm_info["full"] if nlm_info else ""     # for CrossRef API
+    journal_abbrev = nlm_info["abbrev"] if nlm_info else ""  # for PubMed
+    journal_for_api = journal_full or journal  # full name for CrossRef API
+
+    # Build context-derived keywords for search when title_hint is weak.
+    # Exclude author name fragments and journal abbreviation tokens.
+    exclude_words = set()
+    if author:
+        exclude_words |= {w.lower() for w in re.split(r"[\s\-]+", author)}
+    if journal:
+        exclude_words |= {w.lower() for w in re.split(r"[\s.\-:,]+", journal) if w}
+    ctx_keywords = _extract_context_keywords(context, exclude=exclude_words) if context else []
+    ctx_query = " ".join(ctx_keywords[:6]) if ctx_keywords else ""
+
+    seen_dois = set()
+    candidates = []
+
+    def _add_crossref_item(item):
+        doi = item.get("DOI", "")
+        if doi and doi in seen_dois:
+            return
+        s = score_crossref_match(item, author, year, title,
+                                 journal_hint=journal,
+                                 journal_resolved=journal_full,
+                                 context=context)
+        if doi:
+            seen_dois.add(doi)
+        candidates.append((item, s))
+
+    def _add_pubmed_dois(dois):
+        for doi in dois:
+            if doi in seen_dois:
+                continue
             item = crossref_by_doi(doi)
             if item:
-                s = score_crossref_match(item, author, year, title)
-                if s > best_score:
-                    best_score, best_item = s, item
+                _add_crossref_item(item)
+
+    # --- PubMed first: most reliable for biomedical papers ---
+    # Combine title_hint and context keywords for a rich search query.
+    # The title_hint contains inferred topic words; context keywords come from
+    # the surrounding sentence. Together they give PubMed enough to find
+    # the right paper even for common author names.
+    all_topic_words = []
+    if title:
+        all_topic_words.extend(w for w in title.split() if len(w) > 3)
+    if ctx_keywords:
+        all_topic_words.extend(w for w in ctx_keywords if w not in
+                               {w2.lower() for w2 in all_topic_words})
+    # Deduplicate while preserving order
+    seen_w = set()
+    topic_words = []
+    for w in all_topic_words:
+        wl = w.lower()
+        if wl not in seen_w:
+            seen_w.add(wl)
+            topic_words.append(w)
+    topic_query = " ".join(topic_words[:8])
+
+    if author and year:
+        pm_journal = journal_abbrev or journal or None
+        # 1) Author + year + topic keywords (best combo of specificity)
+        if topic_query:
+            pm_dois = search_pubmed(topic_query, author=author, year=year, max_results=5)
+            _add_pubmed_dois(pm_dois)
+            time.sleep(0.3)
+        # 2) Author + year + journal
+        if pm_journal:
+            pm_dois = search_pubmed("", author=author, year=year,
+                                    journal=pm_journal, max_results=5)
+            _add_pubmed_dois(pm_dois)
+            time.sleep(0.3)
+        # 3) Author + year only (broadest)
+        pm_dois = search_pubmed("", author=author, year=year, max_results=20)
+        _add_pubmed_dois(pm_dois)
+        time.sleep(0.3)
+
+    # --- CrossRef queries for additional coverage ---
+    queries = []
+    if title and len(title) > 10:
+        queries.append({"q": title})
+    if author and title and len(title) > 5:
+        queries.append({"q": f"{author} {title}"})
+    if ctx_query and author and journal_for_api:
+        queries.append({"q": f"{author} {ctx_query}", "journal": journal_for_api})
+    if author and journal_for_api and year:
+        queries.append({"q": f"{author} {year}", "journal": journal_for_api})
+    if ctx_query and author:
+        queries.append({"q": f"{author} {ctx_query}"})
+    if author and year:
+        queries.append({"q": f"{author} {year}"})
+
+    best_score = max((s for _, s in candidates), default=-1)
+    for qobj in queries[:4]:
+        if best_score >= 8:
+            break
+        q = qobj["q"] if isinstance(qobj, dict) else qobj
+        j = qobj.get("journal") if isinstance(qobj, dict) else None
+        for item in search_crossref(q, author=author, year=year, journal=j):
+            _add_crossref_item(item)
+        best_score = max((s for _, s in candidates), default=-1)
         time.sleep(0.5)
-    return (best_item, best_score) if best_score >= 4 else (None, best_score)
+    # Re-rank: when context keywords uniquely match one candidate's title
+    # but not others, give it a bonus. This helps disambiguate same-author
+    # same-journal papers (e.g. vedolizumab vs tofacitinib).
+    if ctx_keywords and len(candidates) > 1:
+        for i, (item, s) in enumerate(candidates):
+            it = (item.get("title", [""])[0] if isinstance(item.get("title"), list)
+                  else item.get("title", "")).lower()
+            unique_hits = 0
+            for kw in ctx_keywords:
+                if kw in it:
+                    # Check if this keyword appears in any other candidate's title
+                    in_others = False
+                    for j, (other, _) in enumerate(candidates):
+                        if j == i:
+                            continue
+                        ot = (other.get("title", [""])[0] if isinstance(other.get("title"), list)
+                              else other.get("title", "")).lower()
+                        if kw in ot:
+                            in_others = True
+                            break
+                    if not in_others:
+                        unique_hits += 1
+            if unique_hits > 0:
+                candidates[i] = (item, s + min(unique_hits, 3))
+
+    # Sort by score descending, with context overlap as tiebreaker
+    def _sort_key(candidate):
+        item, s = candidate
+        it = (item.get("title", [""])[0] if isinstance(item.get("title"), list)
+              else item.get("title", "")).lower()
+        ctx_overlap = sum(1 for w in ctx_keywords if w in it) if ctx_keywords else 0
+        return (s, ctx_overlap)
+    candidates.sort(key=_sort_key, reverse=True)
+    if top_n == 1:
+        # Backward-compatible single-result return
+        if candidates and candidates[0][1] >= 4:
+            return (candidates[0][0], candidates[0][1])
+        return (None, candidates[0][1] if candidates else -1)
+    # Return top N candidates
+    return candidates[:top_n]
 
 
 # ---------------------------------------------------------------------------
@@ -760,42 +1093,33 @@ def parse_json_response(raw):
     return json.loads(raw)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="zotellm: one-command citation formatting with Zotero field codes"
-    )
-    parser.add_argument("input", help="Input file (.md or .docx) with informal citations")
-    parser.add_argument("--output", "-o", help="Output .docx path (default: input_zotero.docx)")
-    parser.add_argument("--provider", "-p", default="openai",
-                        choices=["openai", "anthropic", "cli"],
-                        help="LLM provider (default: openai). 'cli' uses claude/ollama/llm.")
-    parser.add_argument("--model", "-m", help="Model name (default depends on provider)")
-    parser.add_argument("--api-base", help="API base URL for custom endpoints")
-    parser.add_argument("--api-key", help="API key (overrides env var)")
-    parser.add_argument("--cli-command", help="Custom CLI command for --provider cli")
-    parser.add_argument("--zotero-db", help="Path to local zotero.sqlite")
-    parser.add_argument("--zotero-api-key", help="Zotero Web API key (for adding items)")
-    parser.add_argument("--zotero-library-id", help="Zotero user library ID")
-    parser.add_argument("--reference-doc", help="Pandoc reference .docx template (for .md input)")
-    parser.add_argument("--font", default="Calibri", help="Font for citation text (default: Calibri)")
-    parser.add_argument("--size", type=int, default=11, help="Font size in pt (default: 11)")
-    parser.add_argument("--bib-heading", default="References",
-                        help="Heading where bibliography should be inserted (default: References)")
-    parser.add_argument("--no-crossref", action="store_true", help="Skip CrossRef lookups")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
-    args = parser.parse_args()
+def run_zotellm(args, resolve_callback=None):
+    """Core processing logic. Can be called from CLI or GUI.
 
+    Args:
+        args: argparse.Namespace or similar object with attributes:
+              input, output, provider, model, api_base, api_key, cli_command,
+              zotero_db, zotero_api_key, zotero_library_id, reference_doc,
+              font, size, bib_heading, no_crossref, dry_run
+        resolve_callback: Optional callable for uncertain matches.
+              Called as resolve_callback(citation_text, candidates) where candidates
+              is a list of (crossref_item, score) tuples. Should return one of:
+              - a crossref item dict (user picked a candidate)
+              - a string starting with "10." (user entered a DOI)
+              - a string of digits (user entered a PMID)
+              - None (user chose to skip)
+              When None (CLI mode), the best match is auto-picked.
+    """
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"Error: {input_path} not found")
-        sys.exit(1)
+        raise FileNotFoundError(f"{input_path} not found")
 
     is_docx = input_path.suffix.lower() == ".docx"
     is_md = input_path.suffix.lower() in (".md", ".markdown", ".txt")
 
     if not is_docx and not is_md:
-        print(f"Error: unsupported file type '{input_path.suffix}'. Use .md or .docx.")
-        sys.exit(1)
+        raise ValueError(f"Unsupported file type '{input_path.suffix}'. Use .md or .docx.")
 
     output_path = args.output or str(input_path.with_suffix("")) + "_zotero.docx"
     model = args.model or PROVIDER_DEFAULTS.get(args.provider, "gpt-4o")
@@ -833,6 +1157,10 @@ def main():
         elif key and key in all_refs:
             if not all_refs[key].get("title_hint") and cit.get("title_hint"):
                 all_refs[key]["title_hint"] = cit["title_hint"]
+            if not all_refs[key].get("context") and cit.get("context"):
+                all_refs[key]["context"] = cit["context"]
+            if not all_refs[key].get("journal_hint") and cit.get("journal_hint"):
+                all_refs[key]["journal_hint"] = cit["journal_hint"]
 
     if not all_refs:
         print("  No citations found. Nothing to do.")
@@ -877,30 +1205,75 @@ def main():
                 if cr_item:
                     csl = crossref_to_csl(cr_item)
                     csl["id"] = key
-                    print(f"PMID→DOI match - {csl.get('title', '')[:60]}")
+                    print(f"PMID->DOI match - {csl.get('title', '')[:60]}")
 
         # Fall back to search if no direct match
         if csl is None and not args.no_crossref:
-            cr_item, score = find_best_match(ref)
-            if cr_item:
-                csl = crossref_to_csl(cr_item)
-                csl["id"] = key
-                print(f"CrossRef match (score={score})" +
-                      (f" - {csl.get('title', '')[:60]}" if not zotero_key else ""))
+            if resolve_callback:
+                # Get multiple candidates for GUI resolution
+                candidates = find_best_match(ref, top_n=5)
+                top_score = candidates[0][1] if candidates else -1
+                second_score = candidates[1][1] if len(candidates) > 1 else -1
+                # Auto-select only when very confident: high score AND clear
+                # gap over runner-up.  Otherwise show disambiguation dialog.
+                gap = top_score - second_score
+                uncertain = (top_score < 10) or (gap <= 3 and top_score < 14)
+                if uncertain and candidates:
+                    orig_text = ref.get("original_text", f"{author} {year}")
+                    print(f"uncertain (top score={top_score})")
+                    choice = resolve_callback(orig_text, candidates)
+                    if choice is None:
+                        print(f"    skipped by user")
+                    elif isinstance(choice, str):
+                        # User entered a DOI or PMID
+                        if choice.startswith("10."):
+                            cr_item = crossref_by_doi(choice)
+                        else:
+                            doi_from_pmid = pmid_to_doi(choice)
+                            cr_item = crossref_by_doi(doi_from_pmid) if doi_from_pmid else None
+                        if cr_item:
+                            csl = crossref_to_csl(cr_item)
+                            csl["id"] = key
+                            print(f"    user-provided match - {csl.get('title', '')[:60]}")
+                    else:
+                        # User picked a candidate (crossref item dict)
+                        csl = crossref_to_csl(choice)
+                        csl["id"] = key
+                        print(f"    user-selected match - {csl.get('title', '')[:60]}")
+                elif candidates and top_score >= 4:
+                    cr_item = candidates[0][0]
+                    csl = crossref_to_csl(cr_item)
+                    csl["id"] = key
+                    print(f"CrossRef match (score={top_score})" +
+                          (f" - {csl.get('title', '')[:60]}" if not zotero_key else ""))
+                else:
+                    print("no match")
             else:
-                print("no match")
+                # CLI mode: auto-pick best
+                cr_item, score = find_best_match(ref)
+                if cr_item:
+                    csl = crossref_to_csl(cr_item)
+                    csl["id"] = key
+                    print(f"CrossRef match (score={score})" +
+                          (f" - {csl.get('title', '')[:60]}" if not zotero_key else ""))
+                else:
+                    print("no match")
         elif csl is None:
             print("skipping lookup")
 
         if csl is None:
-            csl = {"id": key, "type": "article-journal",
-                   "title": ref.get("title") or ref.get("title_hint", f"[{key}]")}
+            # No match found -- create a placeholder. Mark the title so it's
+            # obvious this needs manual verification.
+            raw_title = ref.get("title") or ref.get("title_hint", "")
+            placeholder_title = f"[UNRESOLVED] {raw_title}" if raw_title else f"[UNRESOLVED: {key}]"
+            csl = {"id": key, "type": "article-journal", "title": placeholder_title}
             if author:
                 csl["author"] = [{"family": author}]
             if year:
                 csl["issued"] = {"date-parts": [[int(year)]]}
             if ref.get("journal") or ref.get("journal_hint"):
                 csl["container-title"] = ref.get("journal") or ref.get("journal_hint")
+            print(f"    WARNING: no verified match found for {key}")
 
         bib_items.append(csl)
         keymap[key] = zotero_key
@@ -987,7 +1360,7 @@ def main():
         os.unlink(tmp_md.name)
         if result.returncode != 0:
             print(f"Pandoc error: {result.stderr}")
-            sys.exit(1)
+            raise RuntimeError(f"Pandoc error: {result.stderr}")
 
         # Insert Zotero fields
         print(f"\nStep 5: Inserting Zotero field codes...")
@@ -1023,6 +1396,41 @@ def main():
     print(f"  Bibliography: {bib_path} ({len(bib_items)} items)")
     print(f"  Keymap: {keymap_path}")
     print(f"  Open in Word and click Zotero > Refresh")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="zotellm: one-command citation formatting with Zotero field codes"
+    )
+    parser.add_argument("input", help="Input file (.md or .docx) with informal citations")
+    parser.add_argument("--output", "-o", help="Output .docx path (default: input_zotero.docx)")
+    parser.add_argument("--provider", "-p", default="openai",
+                        choices=["openai", "anthropic", "cli"],
+                        help="LLM provider (default: openai). 'cli' uses claude/ollama/llm.")
+    parser.add_argument("--model", "-m", help="Model name (default depends on provider)")
+    parser.add_argument("--api-base", help="API base URL for custom endpoints")
+    parser.add_argument("--api-key", help="API key (overrides env var)")
+    parser.add_argument("--cli-command", help="Custom CLI command for --provider cli")
+    parser.add_argument("--zotero-db", help="Path to local zotero.sqlite")
+    parser.add_argument("--zotero-api-key", help="Zotero Web API key (for adding items)")
+    parser.add_argument("--zotero-library-id", help="Zotero user library ID")
+    parser.add_argument("--reference-doc", help="Pandoc reference .docx template (for .md input)")
+    parser.add_argument("--font", default="Calibri", help="Font for citation text (default: Calibri)")
+    parser.add_argument("--size", type=int, default=11, help="Font size in pt (default: 11)")
+    parser.add_argument("--bib-heading", default="References",
+                        help="Heading where bibliography should be inserted (default: References)")
+    parser.add_argument("--no-crossref", action="store_true", help="Skip CrossRef lookups")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
+    args = parser.parse_args()
+
+    try:
+        run_zotellm(args)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

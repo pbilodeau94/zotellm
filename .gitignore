@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Electron
+electron/node_modules/
+electron/dist/
+
+# Test files
+test_*.md
+test_*.docx
+test_*.json
+
+# OS
+.DS_Store
