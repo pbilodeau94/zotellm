@@ -5,14 +5,20 @@ dist/
 __pycache__/
 *.pyc
 
-# Electron
-electron/node_modules/
-electron/dist/
+# Desktop app
+desktop/node_modules/
+desktop/dist/
 
 # Test files
 test_*.md
 test_*.docx
 test_*.json
+
+# Legacy
+llm_reference_formatter.py
+zotellm_gui.py
+zotero_field_insert.py
+HOWTO.md
 
 # OS
 .DS_Store

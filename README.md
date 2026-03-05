@@ -4,7 +4,13 @@ Automatic citation formatting for academic manuscripts. Takes any document (.md 
 
 ## Download
 
-**macOS (Apple Silicon):** Download [zotellm-1.0.0-arm64.dmg](https://github.com/pbilodeau94/zotellm/releases/latest) from the latest release. On first launch, right-click the app > Open to bypass Gatekeeper.
+**macOS (Apple Silicon):** Download [zotellm-1.0.0-arm64.dmg](https://github.com/pbilodeau94/zotellm/releases/latest) from the latest release.
+
+After downloading, open Terminal and run:
+```bash
+xattr -cr /Applications/zotellm.app
+```
+Then open the app normally. (This removes the macOS quarantine flag since the app is not code-signed.)
 
 **All platforms (from source):** See [Running from Source](#running-from-source) below.
 
@@ -83,8 +89,8 @@ pip install pyinstaller python-docx requests
 chmod +x build_backend.sh
 ./build_backend.sh
 
-# 2. Run the Electron app
-cd electron
+# 2. Run the desktop app
+cd desktop
 npm install
 npm start
 ```
